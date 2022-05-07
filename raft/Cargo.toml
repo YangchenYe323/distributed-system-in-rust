@@ -19,6 +19,7 @@ log = "0.4"
 prost = "0.6"
 prost-derive = "0.6"
 rand = "0.7"
+atomic = "0.5"
 
 labcodec = { path = "../labcodec" }
 labrpc = { path = "../labrpc" }

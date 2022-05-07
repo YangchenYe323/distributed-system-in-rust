@@ -4,6 +4,7 @@ extern crate log;
 #[allow(unused_imports)]
 #[macro_use]
 extern crate prost_derive;
+extern crate atomic;
 
 pub mod kvraft;
 mod proto;
