@@ -1,10 +1,11 @@
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::executor::ThreadPool;
 // use futures::lock::Mutex;
+use futures::{select, FutureExt};
 use futures_timer::Delay;
 
 #[cfg(test)]
@@ -17,7 +18,8 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
-use rand::Rng;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -57,6 +59,8 @@ const VOTED_FOR_NO_ONE: usize = usize::MAX;
 
 const TICK_TIME_OUT: u64 = 200;
 
+const RPC_RESEND_TIME_OUT: u64 = 500;
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -70,6 +74,8 @@ pub struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     voted_for: usize,
+    // a random generator to generate random election_tick
+    election_ticks_generator: SmallRng,
     // how many ticks is required to trigger an election
     election_ticks: u64,
     // in how many ticks do we send a hear beat as leader?
@@ -99,10 +105,12 @@ impl Raft {
     ) -> Raft {
         let raft_state = persister.raft_state();
 
-        let mut rng = rand::thread_rng();
+        let election_seed: u64 = rand::thread_rng().gen();
+        let mut rng: SmallRng = SeedableRng::seed_from_u64(election_seed);
         // one tick is 200ms, we want to make election timeout
-        // between 800ms and 1200ms
-        let election_ticks: u64 = rng.gen_range(4, 6);
+        // between 600ms and 2000ms
+        let election_ticks: u64 = rng.gen_range(3, 10);
+        info!("Raft {} Election Ticks: {}", me, election_ticks);
 
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
@@ -111,6 +119,7 @@ impl Raft {
             me,
             state: Arc::default(),
             voted_for: VOTED_FOR_NO_ONE,
+            election_ticks_generator: rng,
             election_ticks,
             election_ticks_elapsed: 0,
             heart_beat_ticks: 1,
@@ -218,6 +227,9 @@ impl Raft {
         crate::your_code_here((index, snapshot));
     }
 
+    // handles transitioning to follower because higher term is found:
+    // 1. update term
+    // 2. transition to follower and vote for no one yet
     fn become_follower(&mut self, term: u64) {
         self.state = Arc::new(State {
             term,
@@ -226,21 +238,34 @@ impl Raft {
         self.voted_for = VOTED_FOR_NO_ONE;
     }
 
+    /// handles state transition to a candidate
+    /// when transitioning to candidate:
+    /// 1. increment term
+    /// 2. vote for myself (reset get vote count)
+    /// 3. reset election_tick
     fn become_candidate(&mut self) {
         self.state = Arc::new(State {
             term: self.state.term + 1,
             is_leader: false,
         });
+        info!(
+            "Raft {} becomes Candidate at Term {}",
+            self.me, self.state.term
+        );
+        self.voted_for = self.me;
+        self.get_vote_from = 1;
+        self.election_ticks_elapsed = 0;
+        self.election_ticks = self.election_ticks_generator.gen_range(3, 10);
+        trace!("Raft {} election tick {}", self.me, self.election_ticks);
     }
 
+    // handles transitioning to leader
     fn become_leader(&mut self) {
         self.state = Arc::new(State {
             term: self.state.term,
             is_leader: true,
         })
     }
-
-    fn heart_beat(&mut self) {}
 }
 
 impl Raft {
@@ -301,15 +326,50 @@ impl Node {
             let mut rf = self.raft.lock().unwrap();
             if rf.state.is_leader {
                 if rf.heart_beat_ticks_elapsed >= rf.heart_beat_ticks {
+                    let heart_beat_args = AppendEntryArgs {
+                        term: rf.state.term,
+                        leader_id: rf.me as u64,
+                        prev_log_index: 0,
+                        prev_log_term: 0,
+                        entries: vec![],
+                        leader_commit: 0,
+                    };
                     // heart beat
-                    rf.heart_beat();
+                    for (i, peer) in rf.peers.iter().enumerate() {
+                        if i == rf.me {
+                            continue;
+                        }
+                        let peer_clone = peer.clone();
+                        let arg = heart_beat_args.clone();
+                        let rf_clone = Arc::clone(&self.raft);
+                        // send heart-beat rpc
+                        self.pool.spawn_ok(async move {
+                            // let response = peer_clone.append_entry(&arg).await;
+                            let response = select! {
+                                res = peer_clone.append_entry(&arg).fuse() => res,
+                                _ = Delay::new(Duration::from_millis(RPC_RESEND_TIME_OUT)).fuse() => Err(labrpc::Error::Timeout),
+                            };
+                            match response {
+                                Ok(AppendEntryReply { term, success: _ }) => {
+                                    let mut rf_guard = rf_clone.lock().unwrap();
+                                    if term > rf_guard.state.term {
+                                        rf_guard.become_follower(term);
+                                    }
+                                }
+
+                                Err(error) => {
+                                    debug!("{}", error);
+                                }
+                            }
+                        })
+                    }
+
                     rf.heart_beat_ticks_elapsed = 0;
                 } else {
                     rf.heart_beat_ticks_elapsed += 1;
                 }
             } else if rf.election_ticks_elapsed >= rf.election_ticks {
                 rf.become_candidate();
-                rf.election_ticks_elapsed = 0;
 
                 let args = RequestVoteArgs {
                     term: rf.state.term,
@@ -318,31 +378,16 @@ impl Node {
                     last_log_term: 0,
                 };
 
-                for peer in &rf.peers {
+                for (i, peer) in rf.peers.iter().enumerate() {
+                    if i == rf.me {
+                        continue;
+                    }
                     let peer_clone = peer.clone();
                     let arg = args.clone();
                     let rf_clone = Arc::clone(&self.raft);
                     // send a request-vote rpc
-                    self.pool.spawn_ok(async move {
-                        let response = peer_clone.request_vote(&arg).await;
-                        match response {
-                            Ok(RequestVoteReply { term, vote_granted }) => {
-                                let mut rf_guard = rf_clone.lock().unwrap();
-                                if term > rf_guard.state.term {
-                                    rf_guard.become_follower(term);
-                                } else if term == rf_guard.state.term && vote_granted {
-                                    rf_guard.get_vote_from += 1;
-                                    // get most vote
-                                    if rf_guard.get_vote_from > rf_guard.peers.len() / 2 {
-                                        rf_guard.become_leader();
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                println!("{}", error);
-                            }
-                        }
-                    })
+                    self.pool
+                        .spawn_ok(handle_request_vote_response(peer_clone, arg, rf_clone))
                 }
             } else {
                 rf.election_ticks_elapsed += 1;
@@ -394,9 +439,10 @@ impl Node {
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
+        let rf = self.raft.lock().unwrap();
         State {
-            term: self.term(),
-            is_leader: self.is_leader(),
+            term: rf.state.term,
+            is_leader: rf.state.is_leader,
         }
     }
 
@@ -440,12 +486,40 @@ impl Node {
     }
 }
 
+// an async task that sends the RequestVote RPC to a given
+// client and handles reply
+async fn handle_request_vote_response(
+    peer: RaftClient,
+    args: RequestVoteArgs,
+    raft: Arc<Mutex<Raft>>,
+) {
+    let resp = peer.request_vote(&args).await;
+    let mut rf_guard = raft.lock().unwrap();
+    match resp {
+        Ok(RequestVoteReply { term, vote_granted }) => {
+            if term > rf_guard.state.term {
+                rf_guard.become_follower(term);
+            } else if term == rf_guard.state.term && vote_granted {
+                rf_guard.get_vote_from += 1;
+                // get most vote
+                if rf_guard.get_vote_from > rf_guard.peers.len() / 2 {
+                    rf_guard.become_leader();
+                }
+            }
+        }
+        Err(error) => {
+            trace!("Raft {} Request Vote Error: {}", rf_guard.me, error);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl RaftService for Node {
     // example RequestVote RPC handler.
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
+        debug!("Get RequestVote from Raft {}", args.candidate_id);
         let mut raft = self.raft.lock().unwrap();
         if args.term > raft.state.term {
             raft.become_follower(args.term);
@@ -461,6 +535,15 @@ impl RaftService for Node {
             let candidate_id = args.candidate_id as usize;
             if raft.voted_for == candidate_id || raft.voted_for == VOTED_FOR_NO_ONE {
                 raft.voted_for = candidate_id;
+
+                info!(
+                    "Raft {} Votes for {} in Term {}",
+                    raft.me, candidate_id, args.term
+                );
+
+                // suppress re-election cycle
+                raft.election_ticks_elapsed = 0;
+
                 Ok(RequestVoteReply {
                     term: raft.state.term,
                     vote_granted: true,
@@ -471,6 +554,26 @@ impl RaftService for Node {
                     vote_granted: false,
                 })
             }
+        }
+    }
+
+    async fn append_entry(&self, args: AppendEntryArgs) -> labrpc::Result<AppendEntryReply> {
+        let mut raft = self.raft.lock().unwrap();
+        if args.term > raft.state.term {
+            raft.become_follower(args.term);
+        }
+
+        if args.term < raft.state.term {
+            Ok(AppendEntryReply {
+                term: raft.state.term,
+                success: false,
+            })
+        } else {
+            raft.election_ticks_elapsed = 0;
+            Ok(AppendEntryReply {
+                term: raft.state.term,
+                success: true,
+            })
         }
     }
 }

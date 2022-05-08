@@ -18,7 +18,7 @@ futures-timer = "3.0"
 log = "0.4"
 prost = "0.6"
 prost-derive = "0.6"
-rand = "0.7"
+rand = {version = "0.7", features = ["small_rng"]}
 atomic = "0.5"
 
 labcodec = { path = "../labcodec" }

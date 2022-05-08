@@ -5,6 +5,7 @@ pub mod raftpb {
         service raft {
             rpc request_vote(RequestVoteArgs) returns (RequestVoteReply);
 
+            rpc append_entry(AppendEntryArgs) returns (AppendEntryReply);
             // Your code here if more rpc desired.
             // rpc xxx(yyy) returns (zzz)
         }
