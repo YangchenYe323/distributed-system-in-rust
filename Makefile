@@ -2,7 +2,7 @@ export RUSTFLAGS=-Dwarnings
 export RUST_TEST_THREADS=1
 export RUST_BACKTRACE=1
 
-LOG_LEVEL ?= raft=info,percolator=info
+LOG_LEVEL ?= raft=debug,percolator=info
 
 check:
 	cargo fmt --all -- --check

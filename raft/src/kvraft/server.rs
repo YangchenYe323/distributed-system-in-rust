@@ -76,19 +76,12 @@ impl Node {
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        self.get_state().term()
+        0
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        self.get_state().is_leader()
-    }
-
-    pub fn get_state(&self) -> raft::State {
-        // Your code here.
-        raft::State {
-            ..Default::default()
-        }
+        false
     }
 }
 

@@ -23,6 +23,7 @@ rand = "0.7"
 labcodec = { path = "../labcodec" }
 labrpc = { path = "../labrpc" }
 linearizability = { path = "../linearizability"}
+futures-cpupool = "0.1.8"
 
 [dev-dependencies]
 env_logger = "0.7"
