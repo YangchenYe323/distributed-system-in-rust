@@ -1,5 +1,4 @@
 syntax = "proto3";
-
 package raftpb;
 
 // Example RequestVote RPC arguments structure.
@@ -19,6 +18,14 @@ message RequestVoteReply {
 message AppendEntryArgs {
 	uint64 term = 1;
 	uint64 leader_id = 2;
+	uint64 prev_log_term = 3;
+	uint64 prev_log_index = 4;
+	message Entry {
+		uint64 term = 1;
+		bytes data = 2;
+	}
+	repeated Entry entries = 5;
+	uint64 leader_commit = 6;
 }
 
 message AppendEntryReply {
