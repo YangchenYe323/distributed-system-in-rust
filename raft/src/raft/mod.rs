@@ -14,11 +14,14 @@ pub mod persister;
 #[cfg(test)]
 mod tests;
 
+mod log;
+
 use self::errors::*;
 use self::persister::*;
+use crate::proto::raftpb::append_entry_args::Entry;
 use crate::proto::raftpb::*;
 
-const TICK_TIME_OUT: u64 = 200;
+const TICK_TIME_OUT: u64 = 100;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -44,7 +47,7 @@ struct PersistentState {
     // leader that receives vote in current term
     vote_for: Option<u64>,
     // log: (term, data),
-    _log: Vec<(u64, Vec<u8>)>,
+    log: log::Log,
 }
 
 impl PersistentState {
@@ -62,6 +65,14 @@ impl PersistentState {
 
     fn vote_for_mut(&mut self) -> &mut Option<u64> {
         &mut self.vote_for
+    }
+
+    fn log(&self) -> &log::Log {
+        &self.log
+    }
+
+    fn log_mut(&mut self) -> &mut log::Log {
+        &mut self.log
     }
 }
 
@@ -126,12 +137,28 @@ pub struct Raft {
     get_vote_from: HashSet<u64>,
 
     // raft's apply channel
-    _apply_ch: UnboundedSender<ApplyMsg>,
+    apply_ch: UnboundedSender<ApplyMsg>,
 
     // raft sends its RPCEvent to this channel, which will be polled
     // in a background thread
-    // entry: (from, event)
-    rpc_ch: Option<Sender<(usize, RPCEvent)>>,
+    // entry: (from, last_log_index, event)
+    // last_log_index is used to update peer's next_index and match_index
+    rpc_ch: Option<Sender<(usize, u64, RPCEvent)>>,
+
+    // leader state
+    // peer -> index of next log entry to send
+    next_index: Vec<u64>,
+    // peer -> last matching log index
+    match_index: Vec<u64>,
+    // index of the largest committed log entry
+    // a log n is committed if for more than half peers j,
+    // next_index[j] >= n
+    commit_index: u64,
+    // flag indicating whether the leader has committed
+    // in the current term
+    has_committed_in_term: bool,
+    // index of last applied log
+    apply_index: u64,
 }
 
 impl Raft {
@@ -150,6 +177,7 @@ impl Raft {
         apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
+        let num_peers = peers.len();
 
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
@@ -161,8 +189,13 @@ impl Raft {
             boot_time: Instant::now(),
             election_next_time: 0,
             get_vote_from: HashSet::new(),
-            _apply_ch: apply_ch,
+            apply_ch,
             rpc_ch: None,
+            next_index: vec![0; num_peers],
+            match_index: vec![0; num_peers],
+            commit_index: 0,
+            has_committed_in_term: false,
+            apply_index: 0,
         };
 
         // initialize from state persisted before a crash
@@ -180,7 +213,7 @@ impl Raft {
         *self.state.vote_for_mut() = None;
 
         self.role = Some(Role::Follower);
-        self.election_next_time += get_election_timeout();
+        self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
     }
 
     fn become_candidate(&mut self) {
@@ -210,8 +243,8 @@ impl Raft {
                     RequestVoteArgs {
                         term: self.state.term(),
                         candidate_id: self.me as u64,
-                        last_log_term: 0,
-                        last_log_index: 0,
+                        last_log_term: self.state.log().last_log_term(),
+                        last_log_index: self.state.log().last_log_index(),
                     },
                 )
             }
@@ -228,6 +261,12 @@ impl Raft {
         self.role = Some(Role::Leader);
 
         // initialize leader state
+        let last_log_index = self.state.log().last_log_index();
+        // next index is initialized to last_log_index + 1 so that the new
+        // leader will never try to sync a log entry of previous terms
+        self.next_index = vec![last_log_index + 1; self.peers.len()];
+        self.match_index = vec![0; self.peers.len()];
+        self.has_committed_in_term = false;
 
         // start heart beat
         self.heartbeat();
@@ -238,12 +277,25 @@ impl Raft {
             match role {
                 Role::Leader => {
                     self.heartbeat();
+
+                    // // sync log
+                    // let index = self.state.log().last_log_index();
+                    // for peer in 0..self.peers.len() {
+                    //     if peer != self.me && self.next_index[peer] <= index {
+                    //         self.send_log_to(peer);
+                    //     }
+                    // }
                 }
                 Role::Follower | Role::Candidate => {
                     if self.boot_time.elapsed().as_millis() >= self.election_next_time {
                         self.become_candidate();
                     }
                 }
+            }
+
+            // apply message
+            if self.apply_index < self.commit_index {
+                self.apply();
             }
         }
     }
@@ -297,6 +349,7 @@ impl Raft {
     fn send_request_vote(&self, server: usize, args: RequestVoteArgs) {
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
+        let last_log_index = args.last_log_index;
 
         let rpc_ch = self.rpc_ch.clone();
 
@@ -305,7 +358,7 @@ impl Raft {
                 let reply = peer_clone.request_vote(&args).await;
 
                 if let Ok(reply) = reply {
-                    ch.send((server, RPCEvent::RequestVote(reply)))
+                    ch.send((server, last_log_index, RPCEvent::RequestVote(reply)))
                         .expect("RPC listening end is dropped");
                 }
             })
@@ -317,16 +370,29 @@ impl Raft {
             self.become_follower(args.term);
         }
 
+        // check if we can grant this vote
         let vote_granted = if args.term == self.state.term() {
             match self.state.vote_for().as_ref() {
+                // we have voted for someone in the current term
                 Some(&old) => old == args.candidate_id,
-                None => {
-                    self.can_vote_for(args.candidate_id, args.last_log_term, args.last_log_index)
-                }
+                // check log up_to_date
+                None => self.can_vote_for(args.last_log_term, args.last_log_index),
             }
         } else {
+            // leader's term < our term
             false
         };
+
+        if vote_granted {
+            *self.state.vote_for_mut() = Some(args.candidate_id);
+            self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
+            debug!(
+                "Raft {} Votes for {} in Term {}",
+                self.me,
+                args.candidate_id,
+                self.state.term()
+            );
+        }
 
         RequestVoteReply {
             term: self.state.term(),
@@ -334,30 +400,36 @@ impl Raft {
         }
     }
 
-    fn can_vote_for(&mut self, candidate: u64, _last_log_term: u64, _last_log_index: u64) -> bool {
-        // vote for candidate and suppress next election
-        *self.state.vote_for_mut() = Some(candidate);
-        self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
-        debug!(
-            "Raft {} Votes for {} in Term {}",
-            self.me,
-            candidate,
-            self.state.term()
-        );
+    fn can_vote_for(&mut self, last_log_term: u64, last_log_index: u64) -> bool {
+        let self_last_log_index = self.state.log().last_log_index();
+        let self_last_log_term = self.state.log().last_log_term();
 
-        true
+        last_log_term > self_last_log_term // leader's last term is newer
+            || (last_log_term == self_last_log_term // leader's lat term is the same and leader's log is longer
+                && last_log_index >= self_last_log_index)
     }
 
-    fn heartbeat(&self) {
+    fn heartbeat(&mut self) {
         for peer in 0..self.peers.len() {
             if peer != self.me {
-                self.send_append_entry(
-                    peer,
-                    AppendEntryArgs {
-                        term: self.state.term(),
-                        leader_id: self.me as u64,
-                    },
-                )
+                if self.has_committed_in_term {
+                    self.send_log_to(peer);
+                } else {
+                    // we cannot sync with followers before we have
+                    // committed a log in our current term,
+                    // so just use heartbeat to avoid re-election fire
+                    self.send_append_entry(
+                        peer,
+                        AppendEntryArgs {
+                            term: self.state.term(),
+                            leader_id: self.me as u64,
+                            prev_log_term: 0,
+                            prev_log_index: 0,
+                            entries: vec![],
+                            leader_commit: 0,
+                        },
+                    );
+                }
             }
         }
     }
@@ -365,6 +437,8 @@ impl Raft {
     fn send_append_entry(&self, server: usize, args: AppendEntryArgs) {
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
+        // last_log_index is the index of the last log we send in this rpc
+        let last_log_index = args.prev_log_index + args.entries.len() as u64;
 
         let rpc_ch = self.rpc_ch.clone();
 
@@ -373,7 +447,7 @@ impl Raft {
                 let reply = peer_clone.append_entry(&args).await;
 
                 if let Ok(reply) = reply {
-                    ch.send((server, RPCEvent::AppendEntry(reply)))
+                    ch.send((server, last_log_index, RPCEvent::AppendEntry(reply)))
                         .expect("RPC listening end is dropped");
                 }
             })
@@ -388,10 +462,48 @@ impl Raft {
         let success = if args.term == self.state.term() {
             // suppress next election
             self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
-            true
+
+            // check if we have the same log at prev_log_index
+            // for heartbeat: index = 0 and term = 0, which will always match
+            // as this is the first trivial log
+            args.prev_log_index <= self.state.log().last_log_index()
+                && args.prev_log_term == self.state.log().term_at_index(args.prev_log_index)
         } else {
             false
         };
+
+        if success {
+            // try to sync log
+            let mut start_log_index = args.prev_log_index + 1;
+            // note: heartbeat message has no entries
+            for Entry { term, data } in args.entries {
+                // here we conflict with leader, so truncate
+                // all our existing log entries
+                if start_log_index <= self.state.log().last_log_index()
+                    && self.state.log().term_at_index(start_log_index) != term
+                {
+                    debug!(
+                        "Raft {} differs with Leader {} on Inde {}: {} vs {}",
+                        self.me,
+                        args.leader_id,
+                        start_log_index,
+                        self.state.log().term_at_index(start_log_index),
+                        term,
+                    );
+
+                    self.state.log_mut().clear_from_index(start_log_index);
+                }
+
+                // start_log_index might be greater than last_log_index due to
+                // previous truncating
+                if start_log_index > self.state.log().last_log_index() {
+                    self.state.log_mut().append_log((term, data));
+                }
+
+                start_log_index += 1;
+            }
+            self.commit_index = std::cmp::max(self.commit_index, args.leader_commit);
+        }
 
         AppendEntryReply {
             term: self.state.term(),
@@ -399,22 +511,67 @@ impl Raft {
         }
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    // start syncing on the given command,
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
+        if self.role != Some(Role::Leader) {
             Err(Error::NotLeader)
+        } else {
+            info!("Raft {} starts agreement on {:?}", self.me, command);
+
+            let mut buf = vec![];
+            labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+            let term = self.state.term;
+            let index = self.state.log_mut().append_log((term, buf));
+
+            // I and myself are trivially matched
+            self.next_index[self.me] = index + 1;
+            self.match_index[self.me] = index;
+
+            for peer in 0..self.peers.len() {
+                if peer != self.me && self.next_index[peer] <= index {
+                    self.send_log_to(peer);
+                }
+            }
+
+            Ok((index, term))
         }
+    }
+
+    // synchronize log entries with peer
+    fn send_log_to(&mut self, peer: usize) {
+        let mut entries = vec![];
+        // this is the starting point of the entries we send
+        // to this peer
+        let next_index = self.next_index[peer];
+        // this is the entry before the starting point, we need to
+        // agree with our peer on what this entry is
+        let prev_index = next_index - 1;
+        let prev_term = self.state.log().term_at_index(prev_index);
+
+        // build entries
+        let last_index = self.state.log().last_log_index();
+        for i in next_index..=last_index {
+            let (term, data) = self.state.log().log_at_index(i);
+            entries.push(Entry { term, data });
+        }
+        let args = AppendEntryArgs {
+            term: self.state.term(),
+            leader_id: self.me as u64,
+            prev_log_term: prev_term,
+            prev_log_index: prev_index,
+            entries,
+            leader_commit: self.commit_index,
+        };
+
+        debug!(
+            "Raft {} Sync Log With {}: {} -> {}",
+            self.me, peer, prev_index, last_index
+        );
+
+        self.send_append_entry(peer, args);
     }
 
     fn cond_install_snapshot(
@@ -451,14 +608,70 @@ impl Raft {
         }
     }
 
-    fn on_append_entry_reply(&mut self, _from: usize, _reply: AppendEntryReply) {
-        // pass
+    fn on_append_entry_reply(&mut self, from: usize, last_log_index: u64, reply: AppendEntryReply) {
+        if reply.term > self.state.term() {
+            self.become_follower(reply.term);
+        }
+
+        // if we still care about this reply?
+        if reply.term == self.state.term() && self.role == Some(Role::Leader) {
+            if reply.success {
+                debug!(
+                    "Raft {} agreed with Follower {}, -> {}",
+                    self.me, from, last_log_index
+                );
+                self.next_index[from] = last_log_index + 1;
+                self.match_index[from] = last_log_index;
+                self.try_commit();
+            } else {
+                // println!("BBBBB");
+                self.next_index[from] -= 1;
+                self.send_log_to(from);
+            }
+        }
     }
 
-    fn on_event(&mut self, from: usize, event: RPCEvent) {
+    fn on_event(&mut self, from: usize, last_log_index: u64, event: RPCEvent) {
         match event {
             RPCEvent::RequestVote(reply) => self.on_request_vote_reply(from, reply),
-            RPCEvent::AppendEntry(reply) => self.on_append_entry_reply(from, reply),
+            RPCEvent::AppendEntry(reply) => self.on_append_entry_reply(from, last_log_index, reply),
+        }
+    }
+
+    fn try_commit(&mut self) {
+        for n in (self.commit_index + 1)..=self.state.log().last_log_index() {
+            let count = self
+                .match_index
+                .iter()
+                .filter(|match_index| **match_index >= n)
+                .count();
+
+            if count > self.peers.len() / 2 {
+                // more than half of the peers have agreed
+                // on this index
+                // progress commit index
+                debug!("Raft {} commits log index {}", self.me, n);
+                self.has_committed_in_term = true;
+                self.commit_index = n;
+            }
+        }
+    }
+
+    fn apply(&mut self) {
+        for index in (self.apply_index + 1)..=self.commit_index {
+            // if a follower disconnected and then returned to
+            // group, the group might have committed many entries
+            // which it does not have.
+            if index > self.state.log().last_log_index() {
+                break;
+            }
+
+            let (_term, entry) = self.state.log().log_at_index(index);
+            let msg = ApplyMsg::Command { data: entry, index };
+            self.apply_ch
+                .unbounded_send(msg)
+                .expect("Cannot Send to Receiving End");
+            self.apply_index = index;
         }
     }
 }
@@ -529,13 +742,13 @@ impl Node {
         let rf = node.raft.clone();
         // rpc polling thread
         std::thread::spawn(move || {
-            for (from, event) in rx.iter() {
+            for (from, last_log_index, event) in rx.iter() {
                 // info!("Raft {} get RPC {:?} from {}", me, event, from);
                 {
                     let mut rf_guard = rf.lock().unwrap();
 
                     if let Some(rf_guard) = rf_guard.as_mut() {
-                        rf_guard.on_event(from, event);
+                        rf_guard.on_event(from, last_log_index, event);
                     } else {
                         break;
                     }
@@ -562,17 +775,17 @@ impl Node {
     where
         M: labcodec::Message,
     {
-        // Your code here.
-        // Example:
-        // self.raft.start(command)
-        crate::your_code_here(command)
+        let mut raft = self.raft.lock().unwrap();
+        if let Some(raft) = raft.as_mut() {
+            raft.start(command)
+        } else {
+            debug!("Start command on closed raft");
+            Ok((0, 0))
+        }
     }
 
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        // Your code here.
-        // Example:
-        // self.raft.term
         let raft = self.raft.lock().unwrap();
         if let Some(raft) = raft.as_ref() {
             raft.state.term()
@@ -621,7 +834,9 @@ impl Node {
     /// a VIRTUAL crash in tester, so take care of background
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
-        // Your code here, if desired.
+        let mut raft = self.raft.lock().unwrap();
+        raft.take();
+        // raft instance dropped here
     }
 
     /// A service wants to switch to snapshot.  
