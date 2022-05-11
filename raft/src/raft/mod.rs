@@ -229,7 +229,9 @@ impl Raft {
         self.get_vote_from.clear();
         self.get_vote_from.insert(self.me as u64);
 
-        self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
+        let next_time_out = get_election_timeout();
+        debug!("Raft {} next election timeout: {}", self.me, next_time_out);
+        self.election_next_time = self.boot_time.elapsed().as_millis() + next_time_out;
 
         // start election
         self.start_election()
@@ -277,14 +279,6 @@ impl Raft {
             match role {
                 Role::Leader => {
                     self.heartbeat();
-
-                    // // sync log
-                    // let index = self.state.log().last_log_index();
-                    // for peer in 0..self.peers.len() {
-                    //     if peer != self.me && self.next_index[peer] <= index {
-                    //         self.send_log_to(peer);
-                    //     }
-                    // }
                 }
                 Role::Follower | Role::Candidate => {
                     if self.boot_time.elapsed().as_millis() >= self.election_next_time {
@@ -385,6 +379,8 @@ impl Raft {
 
         if vote_granted {
             *self.state.vote_for_mut() = Some(args.candidate_id);
+            // we only reset election time if we decide to grant vote,
+            // otherwise we begin election normally
             self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
             debug!(
                 "Raft {} Votes for {} in Term {}",
@@ -413,6 +409,7 @@ impl Raft {
         for peer in 0..self.peers.len() {
             if peer != self.me {
                 if self.has_committed_in_term {
+                    // use heartbeat to sync log
                     self.send_log_to(peer);
                 } else {
                     // we cannot sync with followers before we have
@@ -483,7 +480,7 @@ impl Raft {
                     && self.state.log().term_at_index(start_log_index) != term
                 {
                     debug!(
-                        "Raft {} differs with Leader {} on Inde {}: {} vs {}",
+                        "Raft {} differs with Leader {} on Index {}: {} vs {}",
                         self.me,
                         args.leader_id,
                         start_log_index,
@@ -498,7 +495,7 @@ impl Raft {
                 // previous truncating
                 if start_log_index > self.state.log().last_log_index() {
                     self.state.log_mut().append_log((term, data));
-                }
+                } // otherwise we already have thie entry
 
                 start_log_index += 1;
             }
@@ -666,11 +663,17 @@ impl Raft {
                 break;
             }
 
-            let (_term, entry) = self.state.log().log_at_index(index);
+            let (term, entry) = self.state.log().log_at_index(index);
             let msg = ApplyMsg::Command { data: entry, index };
             self.apply_ch
                 .unbounded_send(msg)
                 .expect("Cannot Send to Receiving End");
+
+            info!(
+                "Raft {} Applies Message - Index: {} Term: {}",
+                self.me, index, term
+            );
+
             self.apply_index = index;
         }
     }
