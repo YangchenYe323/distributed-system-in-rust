@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 pub mod config;
@@ -39,9 +40,8 @@ pub enum ApplyMsg {
     },
 }
 
-/// Persistent State of a Raft Peer
-#[derive(Default, Debug)]
-struct PersistentState {
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistentData {
     // current term,
     term: u64,
     // leader that receives vote in current term
@@ -50,29 +50,40 @@ struct PersistentState {
     log: log::Log,
 }
 
+/// Persistent State of a Raft Peer
+#[derive(Default, Debug)]
+struct PersistentState {
+    data: PersistentData,
+    // has data been changed since last load from disk?
+    dirty: bool,
+}
+
 impl PersistentState {
     fn term(&self) -> u64 {
-        self.term
+        self.data.term
     }
 
     fn term_mut(&mut self) -> &mut u64 {
-        &mut self.term
+        self.dirty = true;
+        &mut self.data.term
     }
 
     fn vote_for(&self) -> &Option<u64> {
-        &self.vote_for
+        &self.data.vote_for
     }
 
     fn vote_for_mut(&mut self) -> &mut Option<u64> {
-        &mut self.vote_for
+        self.dirty = true;
+        &mut self.data.vote_for
     }
 
     fn log(&self) -> &log::Log {
-        &self.log
+        &self.data.log
     }
 
     fn log_mut(&mut self) -> &mut log::Log {
-        &mut self.log
+        self.dirty = true;
+        &mut self.data.log
     }
 }
 
@@ -298,29 +309,23 @@ impl Raft {
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+        if self.state.dirty {
+            // serialize and save
+            let buf = serde_json::to_vec(&self.state.data).unwrap();
+            self.persister.save_raft_state(buf);
+            self.state.dirty = false;
+        }
     }
 
     /// restore previously persisted state.
     fn restore(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            // bootstrap without any state?
+        if !data.is_empty() {
+            let raft_state: PersistentData = serde_json::from_slice(data).unwrap();
+            self.state = PersistentState {
+                data: raft_state,
+                dirty: false,
+            }
         }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -520,7 +525,7 @@ impl Raft {
 
             let mut buf = vec![];
             labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-            let term = self.state.term;
+            let term = self.state.term();
             let index = self.state.log_mut().append_log((term, buf));
 
             // I and myself are trivially matched

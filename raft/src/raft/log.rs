@@ -1,8 +1,9 @@
+use serde::{Deserialize, Serialize};
 /// A Raft Log
 /// It uses a start_index to hide the implementation
 /// detail of truncating and snapshoting, providing a
 /// unified API of an ever-growing logs.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Log {
     // log starts from start_index,
     // entries before start_index is dropped
