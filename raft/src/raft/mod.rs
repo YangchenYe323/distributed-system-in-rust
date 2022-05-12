@@ -345,7 +345,9 @@ impl Raft {
     /// is no need to implement your own timeouts around this method.
     ///
     /// look at the comments in ../labrpc/src/lib.rs for more details.
-    fn send_request_vote(&self, server: usize, args: RequestVoteArgs) {
+    fn send_request_vote(&mut self, server: usize, args: RequestVoteArgs) {
+        self.persist();
+
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
         let last_log_index = args.last_log_index;
@@ -395,6 +397,9 @@ impl Raft {
             );
         }
 
+        // persist before responding to rpc
+        self.persist();
+
         RequestVoteReply {
             term: self.state.term(),
             vote_granted,
@@ -417,6 +422,7 @@ impl Raft {
                     // use heartbeat to sync log
                     self.send_log_to(peer);
                 } else {
+                    self.persist();
                     // we cannot sync with followers before we have
                     // committed a log in our current term,
                     // so just use heartbeat to avoid re-election fire
@@ -436,7 +442,9 @@ impl Raft {
         }
     }
 
-    fn send_append_entry(&self, server: usize, args: AppendEntryArgs) {
+    fn send_append_entry(&mut self, server: usize, args: AppendEntryArgs) {
+        self.persist();
+
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
         // last_log_index is the index of the last log we send in this rpc
@@ -506,6 +514,9 @@ impl Raft {
             }
             self.commit_index = std::cmp::max(self.commit_index, args.leader_commit);
         }
+
+        // persist before responding to rpc
+        self.persist();
 
         AppendEntryReply {
             term: self.state.term(),
