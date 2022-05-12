@@ -196,7 +196,7 @@ impl Raft {
             persister,
             me,
             state: Default::default(),
-            role: None,
+            role: Some(Role::Follower),
             boot_time: Instant::now(),
             election_next_time: 0,
             get_vote_from: HashSet::new(),
@@ -211,10 +211,13 @@ impl Raft {
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
-        // term starts at 0
-        rf.become_follower(0);
+        rf.reset_election_time();
 
         rf
+    }
+
+    fn reset_election_time(&mut self) {
+        self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
     }
 
     fn become_follower(&mut self, term: u64) {
@@ -224,7 +227,6 @@ impl Raft {
         *self.state.vote_for_mut() = None;
 
         self.role = Some(Role::Follower);
-        self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
     }
 
     fn become_candidate(&mut self) {
@@ -240,10 +242,7 @@ impl Raft {
         self.get_vote_from.clear();
         self.get_vote_from.insert(self.me as u64);
 
-        let next_time_out = get_election_timeout();
-        debug!("Raft {} next election timeout: {}", self.me, next_time_out);
-        self.election_next_time = self.boot_time.elapsed().as_millis() + next_time_out;
-
+        self.reset_election_time();
         // start election
         self.start_election()
     }
@@ -388,7 +387,7 @@ impl Raft {
             *self.state.vote_for_mut() = Some(args.candidate_id);
             // we only reset election time if we decide to grant vote,
             // otherwise we begin election normally
-            self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
+            self.reset_election_time();
             debug!(
                 "Raft {} Votes for {} in Term {}",
                 self.me,
@@ -471,7 +470,7 @@ impl Raft {
 
         let success = if args.term == self.state.term() {
             // suppress next election
-            self.election_next_time = self.boot_time.elapsed().as_millis() + get_election_timeout();
+            self.reset_election_time();
 
             // check if we have the same log at prev_log_index
             // for heartbeat: index = 0 and term = 0, which will always match
