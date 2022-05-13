@@ -31,4 +31,6 @@ message AppendEntryArgs {
 message AppendEntryReply {
 	uint64 term = 1;
 	bool success = 2;
+	uint64 Xterm = 3;
+	uint64 Xindex = 4;
 }
