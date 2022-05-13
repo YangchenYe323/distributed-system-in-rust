@@ -498,17 +498,33 @@ impl Raft {
             self.become_follower(args.term);
         }
 
-        let success = if args.term == self.state.term() {
+        let (success, xterm, xindex) = if args.term == self.state.term() {
             // suppress next election
             self.reset_election_time();
 
             // check if we have the same log at prev_log_index
             // for heartbeat: index = 0 and term = 0, which will always match
             // as this is the first trivial log
-            args.prev_log_index <= self.state.log().last_log_index()
-                && args.prev_log_term == self.state.log().term_at_index(args.prev_log_index)
+
+            // implement fast backup
+            // case 1: prev_log_index is longer than our last log index,
+            // in this case Xterm = u64::MAX(to indicate we are lacking log entries),
+            // Xindex = last_log_index
+            if args.prev_log_index > self.state.log().last_log_index() {
+                (false, u64::MAX, self.state.log().last_log_index())
+            } else if args.prev_log_term != self.state.log().term_at_index(args.prev_log_index) {
+                // term conflict
+                let xterm = self.state.log().term_at_index(args.prev_log_index);
+                let xindex = self
+                    .state
+                    .log()
+                    .first_index_at_term_before(xterm, args.prev_log_index);
+                (false, xterm, xindex)
+            } else {
+                (true, 0, 0)
+            }
         } else {
-            false
+            (false, 0, 0)
         };
 
         if success {
@@ -550,6 +566,8 @@ impl Raft {
         AppendEntryReply {
             term: self.state.term(),
             success,
+            xterm,
+            xindex,
         }
     }
 
@@ -664,8 +682,7 @@ impl Raft {
     }
 
     fn on_append_entry_reply(&mut self, from: usize, rpc_seq: u64, reply: AppendEntryReply) {
-        let (is_heartbeat, prev_log_index, last_log_index) =
-            self.sent_rpc_cache.remove(&rpc_seq).unwrap();
+        let (is_heartbeat, _, last_log_index) = self.sent_rpc_cache.remove(&rpc_seq).unwrap();
 
         if reply.term > self.state.term() {
             self.become_follower(reply.term);
@@ -690,9 +707,47 @@ impl Raft {
                 self.match_index[from] = last_log_index;
                 self.try_commit();
             } else {
-                // println!("BBBBB");
-                self.next_index[from] = prev_log_index - 1;
-                self.send_log_to(from);
+                let (xterm, xindex) = (reply.xterm, reply.xindex);
+                debug!(
+                    "Raft {} at Term {} conflicts with peer {} at Term {} Index {}",
+                    self.me,
+                    self.state.term(),
+                    from,
+                    xterm,
+                    xindex
+                );
+
+                // case 1: xindex < self.start_index
+                // send a snapshot (unimplemented for now)
+                if xindex < self.state.log().first_log_index() {
+                    panic!(
+                        "Raft {} conflicts with peer {} at xindex {}, start index {}",
+                        self.me,
+                        from,
+                        xindex,
+                        self.state.log().first_log_index()
+                    );
+                } else if let Some(last_index) = self.state.log().last_index_at_term(xterm) {
+                    // case 2: we have an entry at the conflicting term
+                    // send the last entry of that term to follower
+
+                    // sanity check: our last index
+                    // at conflicting term should be at least
+                    // as large as follower's first index at that term
+                    assert!(
+                        last_index >= xindex,
+                        "last index {}, xindex {}",
+                        last_index,
+                        xindex
+                    );
+
+                    self.next_index[from] = last_index;
+                } else {
+                    // case 3: we don't have an entry at the conflicting term
+                    // just skip the whole term and try to match follower's entry for
+                    // last term
+                    self.next_index[from] = xindex;
+                }
             }
         }
     }
