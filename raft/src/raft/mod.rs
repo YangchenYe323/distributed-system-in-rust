@@ -509,9 +509,9 @@ impl Raft {
             // implement fast backup
             // case 1: prev_log_index is longer than our last log index,
             // in this case Xterm = u64::MAX(to indicate we are lacking log entries),
-            // Xindex = last_log_index
+            // Xindex = last_log_index + 1
             if args.prev_log_index > self.state.log().last_log_index() {
-                (false, u64::MAX, self.state.log().last_log_index())
+                (false, u64::MAX, self.state.log().last_log_index() + 1)
             } else if args.prev_log_term != self.state.log().term_at_index(args.prev_log_index) {
                 // term conflict
                 let xterm = self.state.log().term_at_index(args.prev_log_index);
