@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -118,6 +118,19 @@ enum RPCEvent {
     AppendEntry(AppendEntryReply),
 }
 
+#[derive(Debug, Default)]
+struct RPCSeqGenerator {
+    cur_id: u64,
+}
+
+impl RPCSeqGenerator {
+    fn next_seq(&mut self) -> u64 {
+        let cur_seq = self.cur_id;
+        self.cur_id += 1;
+        cur_seq
+    }
+}
+
 // get a random election timeout between 800ms to 2000ms
 fn get_election_timeout() -> u128 {
     rand::thread_rng().gen_range(800, 2000)
@@ -155,6 +168,13 @@ pub struct Raft {
     // entry: (from, last_log_index, event)
     // last_log_index is used to update peer's next_index and match_index
     rpc_ch: Option<Sender<(usize, u64, RPCEvent)>>,
+
+    // maps rpc_sequence_number -> (is_heartbeat, prev_log_index, last_log_index)
+    // at the time when this rpc is sent,
+    sent_rpc_cache: HashMap<u64, (bool, u64, u64)>,
+
+    // generate mono-increasing rpc sequence numbers
+    rpc_seq_generator: RPCSeqGenerator,
 
     // leader state
     // peer -> index of next log entry to send
@@ -202,6 +222,8 @@ impl Raft {
             get_vote_from: HashSet::new(),
             apply_ch,
             rpc_ch: None,
+            sent_rpc_cache: HashMap::new(),
+            rpc_seq_generator: Default::default(),
             next_index: vec![0; num_peers],
             match_index: vec![0; num_peers],
             commit_index: 0,
@@ -349,7 +371,6 @@ impl Raft {
 
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
-        let last_log_index = args.last_log_index;
 
         let rpc_ch = self.rpc_ch.clone();
 
@@ -358,7 +379,7 @@ impl Raft {
                 let reply = peer_clone.request_vote(&args).await;
 
                 if let Ok(reply) = reply {
-                    ch.send((server, last_log_index, RPCEvent::RequestVote(reply)))
+                    ch.send((server, 0, RPCEvent::RequestVote(reply)))
                         .expect("RPC listening end is dropped");
                 }
             })
@@ -435,19 +456,28 @@ impl Raft {
                             entries: vec![],
                             leader_commit: 0,
                         },
+                        true,
                     );
                 }
             }
         }
     }
 
-    fn send_append_entry(&mut self, server: usize, args: AppendEntryArgs) {
+    fn send_append_entry(&mut self, server: usize, args: AppendEntryArgs, is_hearbeat: bool) {
         self.persist();
+
+        let seq = self.rpc_seq_generator.next_seq();
+        self.sent_rpc_cache.insert(
+            seq,
+            (
+                is_hearbeat,
+                args.prev_log_index,
+                args.prev_log_index + args.entries.len() as u64,
+            ),
+        );
 
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
-        // last_log_index is the index of the last log we send in this rpc
-        let last_log_index = args.prev_log_index + args.entries.len() as u64;
 
         let rpc_ch = self.rpc_ch.clone();
 
@@ -456,7 +486,7 @@ impl Raft {
                 let reply = peer_clone.append_entry(&args).await;
 
                 if let Ok(reply) = reply {
-                    ch.send((server, last_log_index, RPCEvent::AppendEntry(reply)))
+                    ch.send((server, seq, RPCEvent::AppendEntry(reply)))
                         .expect("RPC listening end is dropped");
                 }
             })
@@ -531,12 +561,18 @@ impl Raft {
         if self.role != Some(Role::Leader) {
             Err(Error::NotLeader)
         } else {
-            info!("Raft {} starts agreement on {:?}", self.me, command);
-
             let mut buf = vec![];
             labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
             let term = self.state.term();
             let index = self.state.log_mut().append_log((term, buf));
+
+            info!(
+                "Raft {} at term {} starts agreement on {:?} at Index {}",
+                self.me,
+                self.state.term(),
+                command,
+                index
+            );
 
             // I and myself are trivially matched
             self.next_index[self.me] = index + 1;
@@ -558,6 +594,9 @@ impl Raft {
         // this is the starting point of the entries we send
         // to this peer
         let next_index = self.next_index[peer];
+        if next_index == 0 {
+            warn!("Raft {} next index 0 for peer {}", self.me, peer);
+        }
         // this is the entry before the starting point, we need to
         // agree with our peer on what this entry is
         let prev_index = next_index - 1;
@@ -579,11 +618,15 @@ impl Raft {
         };
 
         debug!(
-            "Raft {} Sync Log With {}: {} -> {}",
-            self.me, peer, prev_index, last_index
+            "Raft {} at Term {} Sync Log With {}: {} -> {}",
+            self.me,
+            self.state.term(),
+            peer,
+            prev_index,
+            last_index
         );
 
-        self.send_append_entry(peer, args);
+        self.send_append_entry(peer, args, false);
     }
 
     fn cond_install_snapshot(
@@ -620,33 +663,51 @@ impl Raft {
         }
     }
 
-    fn on_append_entry_reply(&mut self, from: usize, last_log_index: u64, reply: AppendEntryReply) {
+    fn on_append_entry_reply(&mut self, from: usize, rpc_seq: u64, reply: AppendEntryReply) {
+        let (is_heartbeat, prev_log_index, last_log_index) =
+            self.sent_rpc_cache.remove(&rpc_seq).unwrap();
+
         if reply.term > self.state.term() {
             self.become_follower(reply.term);
         }
 
         // if we still care about this reply?
         if reply.term == self.state.term() && self.role == Some(Role::Leader) {
+            if is_heartbeat {
+                // ignore heartbeat reply
+                return;
+            }
+
             if reply.success {
                 debug!(
-                    "Raft {} agreed with Follower {}, -> {}",
-                    self.me, from, last_log_index
+                    "Raft {} at Term {} agreed with Follower {}, -> {}",
+                    self.me,
+                    self.state.term(),
+                    from,
+                    last_log_index
                 );
                 self.next_index[from] = last_log_index + 1;
                 self.match_index[from] = last_log_index;
                 self.try_commit();
             } else {
                 // println!("BBBBB");
-                self.next_index[from] -= 1;
+                self.next_index[from] = prev_log_index - 1;
                 self.send_log_to(from);
             }
         }
     }
 
-    fn on_event(&mut self, from: usize, last_log_index: u64, event: RPCEvent) {
+    fn on_event(&mut self, from: usize, rpc_seq: u64, event: RPCEvent) {
+        trace!(
+            "Raft {} at Term {} get rpc reply {:?} from {}",
+            self.me,
+            self.state.term(),
+            event,
+            from
+        );
         match event {
             RPCEvent::RequestVote(reply) => self.on_request_vote_reply(from, reply),
-            RPCEvent::AppendEntry(reply) => self.on_append_entry_reply(from, last_log_index, reply),
+            RPCEvent::AppendEntry(reply) => self.on_append_entry_reply(from, rpc_seq, reply),
         }
     }
 
@@ -685,8 +746,11 @@ impl Raft {
                 .expect("Cannot Send to Receiving End");
 
             info!(
-                "Raft {} Applies Message - Index: {} Term: {}",
-                self.me, index, term
+                "Raft {} at Term {} Applies Message - Index: {} Term: {}",
+                self.me,
+                self.state.term(),
+                index,
+                term
             );
 
             self.apply_index = index;
@@ -760,13 +824,13 @@ impl Node {
         let rf = node.raft.clone();
         // rpc polling thread
         std::thread::spawn(move || {
-            for (from, last_log_index, event) in rx.iter() {
+            for (from, rpc_seq, event) in rx.iter() {
                 // info!("Raft {} get RPC {:?} from {}", me, event, from);
                 {
                     let mut rf_guard = rf.lock().unwrap();
 
                     if let Some(rf_guard) = rf_guard.as_mut() {
-                        rf_guard.on_event(from, last_log_index, event);
+                        rf_guard.on_event(from, rpc_seq, event);
                     } else {
                         break;
                     }
