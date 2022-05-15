@@ -22,7 +22,7 @@ use self::persister::*;
 use crate::proto::raftpb::append_entry_args::Entry;
 use crate::proto::raftpb::*;
 
-const TICK_TIME_OUT: u64 = 100;
+const TICK_TIME_OUT: u64 = 10;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -642,11 +642,6 @@ impl Raft {
         // build entries
         let last_index = self.state.log().last_log_index();
 
-        if next_index == last_index {
-            // no need to send log
-            return;
-        }
-
         for i in next_index..=last_index {
             let (term, data) = self.state.log().log_at_index(i);
             entries.push(Entry { term, data });
@@ -702,6 +697,17 @@ impl Raft {
 
         if reply.term > self.state.term() {
             self.become_follower(reply.term);
+        }
+
+        if !is_heartbeat {
+            trace!(
+                "Raft {} at Term {} get rpc reply {:?} to rpc {} from {}",
+                self.me,
+                self.state.term(),
+                reply,
+                rpc_seq,
+                from,
+            );
         }
 
         // if we still care about this reply?
@@ -776,14 +782,6 @@ impl Raft {
     }
 
     fn on_event(&mut self, from: usize, rpc_seq: u64, event: RPCEvent) {
-        trace!(
-            "Raft {} at Term {} get rpc reply {:?} to rpc {} from {}",
-            self.me,
-            self.state.term(),
-            event,
-            rpc_seq,
-            from
-        );
         match event {
             RPCEvent::RequestVote(reply) => self.on_request_vote_reply(from, reply),
             RPCEvent::AppendEntry(reply) => self.on_append_entry_reply(from, rpc_seq, reply),
