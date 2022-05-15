@@ -141,54 +141,54 @@ impl Log {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+    use super::*;
 
-	#[test]
-	fn test_log_first_index_at_term() {
-		let mut l = Log::new();
-		// log entry terms are [1, 1, 2, 2, 2, 3, 3, 3, 4]
-		let terms = [1, 1, 2, 2, 2, 3, 3, 3, 4];
-		for t in terms {
-			l.append_log((t, vec![]));
-		}
-		assert_eq!(3, l.first_index_at_term_before(2, 3));
-		assert_eq!(6, l.first_index_at_term_before(3, 7));
-	}
+    #[test]
+    fn test_log_first_index_at_term() {
+        let mut l = Log::new();
+        // log entry terms are [1, 1, 2, 2, 2, 3, 3, 3, 4]
+        let terms = [1, 1, 2, 2, 2, 3, 3, 3, 4];
+        for t in terms {
+            l.append_log((t, vec![]));
+        }
+        assert_eq!(3, l.first_index_at_term_before(2, 3));
+        assert_eq!(6, l.first_index_at_term_before(3, 7));
+    }
 
-	#[test]
-	fn test_log_last_index_at_term_exist() {
-		let mut l = Log::new();
-		// log entry terms are [1, 1, 2, 2, 2, 3, 3, 3, 4]
-		let terms = [1, 1, 2, 2, 2, 3, 3, 3, 4];
-		for t in terms {
-			l.append_log((t, vec![]));
-		}
-		assert_eq!(Some(2), l.last_index_at_term(1));
-		assert_eq!(Some(5), l.last_index_at_term(2));
-		assert_eq!(Some(8), l.last_index_at_term(3));
-		assert_eq!(Some(9), l.last_index_at_term(4));
-	}
+    #[test]
+    fn test_log_last_index_at_term_exist() {
+        let mut l = Log::new();
+        // log entry terms are [1, 1, 2, 2, 2, 3, 3, 3, 4]
+        let terms = [1, 1, 2, 2, 2, 3, 3, 3, 4];
+        for t in terms {
+            l.append_log((t, vec![]));
+        }
+        assert_eq!(Some(2), l.last_index_at_term(1));
+        assert_eq!(Some(5), l.last_index_at_term(2));
+        assert_eq!(Some(8), l.last_index_at_term(3));
+        assert_eq!(Some(9), l.last_index_at_term(4));
+    }
 
-	#[test]
-	fn test_log_last_index_at_term_integrated() {
-		let mut l = Log::new();
-		// log entry terms are [1, 3, 3, 5, 5, 7, 9, 11, 11, 11]
-		let terms = [1, 3, 3, 5, 5, 7, 9, 11, 11, 11];
-		for t in terms {
-			l.append_log((t, vec![]));
-		}
-		// should not find
-		assert_eq!(None, l.last_index_at_term(2));
-		assert_eq!(None, l.last_index_at_term(4));
-		assert_eq!(None, l.last_index_at_term(6));
-		assert_eq!(None, l.last_index_at_term(10));
+    #[test]
+    fn test_log_last_index_at_term_integrated() {
+        let mut l = Log::new();
+        // log entry terms are [1, 3, 3, 5, 5, 7, 9, 11, 11, 11]
+        let terms = [1, 3, 3, 5, 5, 7, 9, 11, 11, 11];
+        for t in terms {
+            l.append_log((t, vec![]));
+        }
+        // should not find
+        assert_eq!(None, l.last_index_at_term(2));
+        assert_eq!(None, l.last_index_at_term(4));
+        assert_eq!(None, l.last_index_at_term(6));
+        assert_eq!(None, l.last_index_at_term(10));
 
-		// should find
-		assert_eq!(Some(1), l.last_index_at_term(1));
-		assert_eq!(Some(3), l.last_index_at_term(3));
-		assert_eq!(Some(5), l.last_index_at_term(5));
-		assert_eq!(Some(6), l.last_index_at_term(7));
-		assert_eq!(Some(7), l.last_index_at_term(9));
-		assert_eq!(Some(10), l.last_index_at_term(11));
-	}
+        // should find
+        assert_eq!(Some(1), l.last_index_at_term(1));
+        assert_eq!(Some(3), l.last_index_at_term(3));
+        assert_eq!(Some(5), l.last_index_at_term(5));
+        assert_eq!(Some(6), l.last_index_at_term(7));
+        assert_eq!(Some(7), l.last_index_at_term(9));
+        assert_eq!(Some(10), l.last_index_at_term(11));
+    }
 }
