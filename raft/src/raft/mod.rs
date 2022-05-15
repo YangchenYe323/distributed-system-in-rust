@@ -693,24 +693,21 @@ impl Raft {
             self.become_follower(reply.term);
         }
 
-        if !is_heartbeat {
-            trace!(
-                "Raft {} at Term {} get rpc reply {:?} to rpc {} from {}",
-                self.me,
-                self.state.term(),
-                reply,
-                rpc_seq,
-                from,
-            );
+        if is_heartbeat {
+            return;
         }
+
+        trace!(
+            "Raft {} at Term {} get rpc reply {:?} to rpc {} from {}",
+            self.me,
+            self.state.term(),
+            reply,
+            rpc_seq,
+            from,
+        );
 
         // if we still care about this reply?
         if reply.term == self.state.term() && self.role == Some(Role::Leader) {
-            if is_heartbeat {
-                // ignore heartbeat reply
-                return;
-            }
-
             if reply.success {
                 debug!(
                     "Raft {} at Term {} agreed with Follower {}, -> {}",
@@ -770,6 +767,7 @@ impl Raft {
 
                 if next_index < self.next_index[from] {
                     self.next_index[from] = next_index;
+                    self.send_log_to(from);
                 }
             }
         }
