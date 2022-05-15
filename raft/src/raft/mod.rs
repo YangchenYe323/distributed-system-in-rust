@@ -156,26 +156,20 @@ pub struct Raft {
     // next time of heart beat (in millisecond) since boot
     // next time to start an election
     election_next_time: u128,
-
     // count vote from other peers
     get_vote_from: HashSet<u64>,
-
     // raft's apply channel
     apply_ch: UnboundedSender<ApplyMsg>,
-
     // raft sends its RPCEvent to this channel, which will be polled
     // in a background thread
-    // entry: (from, last_log_index, event)
-    // last_log_index is used to update peer's next_index and match_index
+    // entry: (from, rpc_seq, event)
+    // rpc_seq matches the event to its corresponding request
     rpc_ch: Option<Sender<(usize, u64, RPCEvent)>>,
-
     // maps rpc_sequence_number -> (is_heartbeat, prev_log_index, last_log_index)
     // at the time when this rpc is sent,
     sent_rpc_cache: HashMap<u64, (bool, u64, u64)>,
-
     // generate mono-increasing rpc sequence numbers
     rpc_seq_generator: RPCSeqGenerator,
-
     // leader state
     // peer -> index of next log entry to send
     next_index: Vec<u64>,
