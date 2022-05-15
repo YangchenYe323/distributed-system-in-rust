@@ -463,18 +463,31 @@ impl Raft {
         }
     }
 
-    fn send_append_entry(&mut self, server: usize, args: AppendEntryArgs, is_hearbeat: bool) {
+    fn send_append_entry(&mut self, server: usize, args: AppendEntryArgs, is_heartbeat: bool) {
         self.persist();
 
         let seq = self.rpc_seq_generator.next_seq();
         self.sent_rpc_cache.insert(
             seq,
             (
-                is_hearbeat,
+                is_heartbeat,
                 args.prev_log_index,
                 args.prev_log_index + args.entries.len() as u64,
             ),
         );
+
+        if !is_heartbeat {
+            trace!(
+                "Raft {} at Term {} Sync Log Seq {} With peer {}, Prev Term {}, Index {} -> {}",
+                self.me,
+                self.state.term(),
+                seq,
+                server,
+                args.prev_log_term,
+                args.prev_log_index,
+                args.prev_log_index + args.entries.len() as u64,
+            );
+        }
 
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
@@ -524,7 +537,7 @@ impl Raft {
                 (true, 0, 0)
             }
         } else {
-            (false, 0, 0)
+            (false, u64::MAX, u64::MAX)
         };
 
         if success {
@@ -612,9 +625,15 @@ impl Raft {
         // this is the starting point of the entries we send
         // to this peer
         let next_index = self.next_index[peer];
-        if next_index == 0 {
-            warn!("Raft {} next index 0 for peer {}", self.me, peer);
-        }
+
+        assert!(
+            next_index > 0,
+            "Raft {} at Term {} next index for peer {} is ZERO",
+            self.me,
+            self.state.term(),
+            peer
+        );
+
         // this is the entry before the starting point, we need to
         // agree with our peer on what this entry is
         let prev_index = next_index - 1;
@@ -622,6 +641,12 @@ impl Raft {
 
         // build entries
         let last_index = self.state.log().last_log_index();
+
+        if next_index == last_index {
+            // no need to send log
+            return;
+        }
+
         for i in next_index..=last_index {
             let (term, data) = self.state.log().log_at_index(i);
             entries.push(Entry { term, data });
@@ -634,15 +659,6 @@ impl Raft {
             entries,
             leader_commit: self.commit_index,
         };
-
-        debug!(
-            "Raft {} at Term {} Sync Log With {}: {} -> {}",
-            self.me,
-            self.state.term(),
-            peer,
-            prev_index,
-            last_index
-        );
 
         self.send_append_entry(peer, args, false);
     }
@@ -703,9 +719,12 @@ impl Raft {
                     from,
                     last_log_index
                 );
-                self.next_index[from] = last_log_index + 1;
-                self.match_index[from] = last_log_index;
-                self.try_commit();
+
+                if last_log_index > self.match_index[from] {
+                    self.next_index[from] = last_log_index + 1;
+                    self.match_index[from] = last_log_index;
+                    self.try_commit();
+                }
             } else {
                 let (xterm, xindex) = (reply.xterm, reply.xindex);
                 debug!(
@@ -719,7 +738,7 @@ impl Raft {
 
                 // case 1: xindex < self.start_index
                 // send a snapshot (unimplemented for now)
-                if xindex < self.state.log().first_log_index() {
+                let next_index = if xindex < self.state.log().first_log_index() {
                     panic!(
                         "Raft {} conflicts with peer {} at xindex {}, start index {}",
                         self.me,
@@ -741,12 +760,16 @@ impl Raft {
                         xindex
                     );
 
-                    self.next_index[from] = last_index;
+                    last_index
                 } else {
                     // case 3: we don't have an entry at the conflicting term
                     // just skip the whole term and try to match follower's entry for
                     // last term
-                    self.next_index[from] = xindex;
+                    xindex
+                };
+
+                if next_index < self.next_index[from] {
+                    self.next_index[from] = next_index;
                 }
             }
         }
@@ -754,10 +777,11 @@ impl Raft {
 
     fn on_event(&mut self, from: usize, rpc_seq: u64, event: RPCEvent) {
         trace!(
-            "Raft {} at Term {} get rpc reply {:?} from {}",
+            "Raft {} at Term {} get rpc reply {:?} to rpc {} from {}",
             self.me,
             self.state.term(),
             event,
+            rpc_seq,
             from
         );
         match event {
